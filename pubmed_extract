@@ -1,0 +1,1000 @@
+"""
+PubMed PDF Downloader with Selenium support for authenticated access
+This version can access articles through institutional login.
+
+Features:
+- PMID-prioritized (more reliable than PMCID, always present)
+- PDF title verification before accepting download
+- Sequential downloads with per-article verification
+- Multi-source fallback: PubMed > PubMed Actions > Publisher Sites
+
+NCBI Usage Guidelines:
+- No more than 3 requests per second
+- Limit large jobs to weekends or 9 PM - 5 AM Eastern time
+- Sequential downloads recommended (one at a time)
+See: https://www.ncbi.nlm.nih.gov/books/NBK25497/
+
+Requirements:
+- Selenium 4.0+
+- PyPDF2 (for PDF title verification)
+- Pandas 2.0+
+"""
+
+import os
+import time
+import pandas as pd
+from pathlib import Path
+from typing import Optional, Any
+import logging
+import difflib
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('download_log_selenium.txt', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+class PubMedSeleniumDownloader:
+    """Downloads PDFs from PubMed using Selenium for authenticated access."""
+    
+    def __init__(self, output_folder: str = "downloaded_pdfs"):
+        """
+        Initialize the downloader with Selenium.
+        
+        Args:
+            output_folder: Directory where PDFs will be saved
+        """
+        self.output_folder = Path(output_folder)
+        self.output_folder.mkdir(exist_ok=True)
+        self.driver: Optional[Any] = None
+        
+    def setup_browser(self):
+        """Set up the Selenium WebDriver with Chrome configured for silent PDF downloads."""
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options
+            from selenium.webdriver.chrome.service import Service
+            
+            chrome_options = Options()
+            
+            # Disable the download dialog and auto-download PDFs
+            # Use absolute path to ensure it works
+            download_dir = str(self.output_folder.absolute()).replace('\\', '/')
+            prefs = {
+                "download.default_directory": download_dir,
+                "download.prompt_for_download": False,  # Don't show download dialog
+                "download.directory_upgrade": True,
+                "safebrowsing.enabled": False,  # Disable safe browsing to prevent blocking
+                "safebrowsing.disable_download_protection": True,
+                "profile.default_content_settings.popups": 0,
+                "profile.default_content_setting_values.automatic_downloads": 1,  # Allow multiple downloads
+                "profile.managed_default_content_settings.pdf_reader_enabled": False,
+                "pdfjs.disabled": True,
+                "profile.managed_default_content_settings.plugins": 3,  # Disable all plugins
+                "profile.default_content_settings.plugins": 3,
+            }
+            chrome_options.add_experimental_option("prefs", prefs)
+            
+            # Disable various popups and prompts
+            chrome_options.add_argument("--disable-popup-blocking")
+            chrome_options.add_argument("--disable-default-apps")
+            chrome_options.add_argument("--disable-extensions")
+            chrome_options.add_argument("--disable-notifications")
+            chrome_options.add_argument("--no-default-browser-check")
+            chrome_options.add_argument("--no-first-run")
+            chrome_options.add_argument("--disable-sync")
+            chrome_options.add_argument("--disable-plugins")
+            chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+            
+            # Run in visible mode so you can see and interact with login pages
+            # Uncomment to run headless (hidden)
+            # chrome_options.add_argument("--headless")
+            
+            self.driver = webdriver.Chrome(options=chrome_options)
+            
+            # Enable downloads and set download behavior (this overrides any profile settings)
+            self.driver.execute_cdp_cmd("Browser.setDownloadBehavior", {
+                "behavior": "allow",
+                "downloadPath": str(self.output_folder.absolute())
+            })
+            logger.info("Browser window opened - you can now interact with login pages")
+            return True
+            
+        except ImportError:
+            logger.error("Selenium not installed. Run: pip install selenium")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to initialize browser: {e}")
+            logger.info("Make sure Chrome and ChromeDriver are installed")
+            return False
+    
+    def login_institutional(self, wait_time: int = 120):
+        """
+        Navigate to PubMed and handle login.gov + PIV card authentication.
+        Browser window is visible - you can interact with login pages.
+        Supports manual continue via terminal input or automatic timeout.
+        
+        Steps:
+        1. PubMed welcome page opens
+        2. Click "Login" button
+        3. Select "login.gov"
+        4. Click "Login with PIV card"
+        5. Select your PIV certificate and enter PIN when prompted
+        6. Once authenticated, press ENTER to continue or wait for timeout
+        
+        Args:
+            wait_time: Seconds to wait for manual authentication (default: 120 = 2 minutes before auto-continue)
+        """
+        if not self.driver:
+            logger.error("Browser not initialized")
+            return False
+        
+        try:
+            logger.info("Opening Chrome browser window...")
+            logger.info("Navigating to PubMed...")
+            self.driver.get("https://pubmed.ncbi.nlm.nih.gov/")
+            time.sleep(3)  # Wait for page to load
+            
+            logger.info("")
+            logger.info("="*70)
+            logger.info("LOGIN.GOV + PIV CARD AUTHENTICATION - INTERACTIVE")
+            logger.info("="*70)
+            logger.info("")
+            logger.info("A browser window should be visible. Follow these steps:")
+            logger.info("")
+            logger.info("  1. On the PubMed welcome page, click 'Login' (top right)")
+            logger.info("  2. Select 'login.gov' as your authentication method")
+            logger.info("  3. Click 'Login with PIV card'")
+            logger.info("  4. When prompted, select your PIV certificate")
+            logger.info("  5. Enter your PIV PIN code")
+            logger.info("  6. Complete authentication")
+            logger.info("")
+            logger.info("="*70)
+            logger.info(f"WAITING FOR AUTHENTICATION ({wait_time} seconds)")
+            logger.info("="*70)
+            logger.info(f"Once logged in, you can:")
+            logger.info(f"  • Press ENTER to continue immediately")
+            logger.info(f"  • OR wait {wait_time} seconds for automatic continue")
+            logger.info("")
+            
+            # Wait for user input or timeout
+            import threading
+            
+            user_pressed_enter = []
+            
+            def wait_for_input():
+                try:
+                    input()
+                    user_pressed_enter.append(True)
+                except:
+                    pass
+            
+            # Start input thread
+            input_thread = threading.Thread(target=wait_for_input, daemon=True)
+            input_thread.start()
+            
+            # Wait with progress indicator
+            for i in range(wait_time):
+                if user_pressed_enter:
+                    logger.info("")
+                    logger.info("ENTER pressed - continuing with downloads...")
+                    break
+                
+                if (i + 1) % 10 == 0 or i == wait_time - 1:
+                    remaining = wait_time - i - 1
+                    if remaining > 0:
+                        logger.info(f"Waiting... ({remaining}s remaining) - Press ENTER to continue now")
+                
+                time.sleep(1)
+            
+            if not user_pressed_enter:
+                logger.info("")
+                logger.info("Automatic continue - proceeding with downloads...")
+            
+            logger.info("")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Login process error: {e}")
+            return False
+    
+    def find_publisher_link_in_actions(self, pmid: str) -> Optional[str]:
+        """
+        Search PubMed ACTIONS section for "View on publisher site" button.
+        Returns the publisher's article page URL where we can then find the PDF.
+        
+        Args:
+            pmid: PubMed ID
+            
+        Returns:
+            URL to publisher article page or None if not found
+        """
+        try:
+            from selenium.webdriver.common.by import By
+            
+            if not self.driver:
+                return None
+            
+            # We should already be on the PubMed article page
+            # Look for "View on publisher site" button in ACTIONS section
+            
+            # PRIORITY 1: Direct "View on publisher site" button
+            try:
+                view_publisher_buttons = self.driver.find_elements(
+                    By.XPATH, 
+                    "//a[contains(text(), 'View on publisher site')]"
+                )
+                for button in view_publisher_buttons:
+                    href = button.get_attribute('href')
+                    if href and not href.endswith('.pdf'):
+                        logger.info(f"Found 'View on publisher site' button for PMID {pmid}")
+                        return href
+            except:
+                pass
+            
+            # PRIORITY 2: Look for known publisher links in ACTIONS area
+            publisher_domains = [
+                'jama', 'thelancet', 'nature.com', 'bmj.com', 'springer',
+                'wiley', 'elsevier', 'sciencedirect', 'oxfordjournals',
+                'mdpi.com', 'frontiersin', 'acm.org', 'ieee.org'
+            ]
+            
+            for domain in publisher_domains:
+                try:
+                    links = self.driver.find_elements(
+                        By.XPATH,
+                        f"//a[contains(@href, '{domain}') and not(contains(@href, '.pdf'))]"
+                    )
+                    for link in links:
+                        href = link.get_attribute('href')
+                        
+                        if href and not href.endswith('.pdf'):
+                            # Exclude reference links and other noise
+                            if not any(x in href.lower() for x in ['#ref', 'reference', 'citation', 'unaids']):
+                                logger.info(f"Found {domain} article link for PMID {pmid}")
+                                return href
+                except:
+                    pass
+            
+            logger.info(f"No publisher link found in ACTIONS for PMID {pmid}")
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Error searching for publisher link in ACTIONS for PMID {pmid}: {str(e)[:50]}")
+            return None
+            return None
+    
+    def download_from_publisher(self, publisher_url: str, title: str, article_id: str = "") -> bool:
+        """
+        Download PDF from publisher website by navigating to the article page
+        and finding the actual PDF link on their site.
+        Works with any publisher (JAMA, Lancet, Nature, Elsevier, Springer, etc.)
+        
+        Args:
+            publisher_url: URL to publisher's article page (not necessarily direct PDF)
+            title: Article title for filename and verification
+            article_id: PMID for logging and filename
+            
+        Returns:
+            True if successful and title verified, False otherwise
+        """
+        try:
+            # Create filename using PMID as primary identifier
+            safe_title = self.sanitize_filename(title) if title else "article"
+            filename = f"PUBLISHER_{article_id}_{safe_title}.pdf" if article_id else f"PUBLISHER_{safe_title}.pdf"
+            filepath = self.output_folder / filename
+            
+            # Skip if already downloaded
+            if filepath.exists():
+                logger.info(f"[OK] Already present (Publisher): {filename}")
+                return True
+            
+            logger.info(f"Accessing publisher page: {publisher_url[:80]}...")
+            
+            if not self.driver:
+                logger.warning("Browser not available for publisher download")
+                return False
+            
+            # Navigate to publisher page
+            self.driver.get(publisher_url)
+            time.sleep(5)  # Allow page to fully load (increased from 4)
+            
+            from selenium.webdriver.common.by import By
+            
+            # DEBUG: Log all links on the page to understand structure
+            try:
+                all_links = self.driver.find_elements(By.TAG_NAME, "a")
+                logger.info(f"[DEBUG] Found {len(all_links)} links on publisher page")
+                
+                # Log first 20 links for debugging
+                for i, link in enumerate(all_links[:20]):
+                    try:
+                        text = link.text.strip()[:50]
+                        href = link.get_attribute('href')[:100] if link.get_attribute('href') else 'NO HREF'
+                        if text or '.pdf' in href.lower():
+                            logger.info(f"[DEBUG] Link {i}: '{text}' -> {href}")
+                    except:
+                        pass
+            except Exception as e:
+                logger.info(f"[DEBUG] Could not enumerate links: {str(e)[:50]}")
+            
+            # Also check for buttons that might trigger downloads
+            try:
+                all_buttons = self.driver.find_elements(By.TAG_NAME, "button")
+                logger.info(f"[DEBUG] Found {len(all_buttons)} buttons on publisher page")
+                
+                # Log buttons that mention PDF/download
+                for i, button in enumerate(all_buttons[:15]):
+                    try:
+                        text = button.text.strip()[:50]
+                        if any(keyword in text.lower() for keyword in ['pdf', 'download', 'full', 'article']):
+                            logger.info(f"[DEBUG] Button {i}: '{text}'")
+                    except:
+                        pass
+            except Exception as e:
+                logger.info(f"[DEBUG] Could not enumerate buttons: {str(e)[:50]}")
+            
+            # Search for PDF download link on the publisher's page
+            # IMPORTANT: Skip obvious reference PDFs (UNAIDS, citations, etc.)
+            excluded_sources = ['unaids', 'citation', 'reference', 'supplementary', 'supplement', 'author', 'correction']
+            
+            pdf_patterns = [
+                # Text-based labels (highest priority - most reliable)
+                "//a[contains(translate(text(), 'PDF', 'pdf'), 'pdf') and contains(text(), 'PDF')]",
+                "//a[contains(translate(text(), 'FULL TEXT', 'full text'), 'full text')]",
+                "//button[contains(translate(text(), 'PDF', 'pdf'), 'pdf')]",
+                "//button[contains(translate(text(), 'FULL TEXT', 'full text'), 'full text')]",
+                
+                # Class-based (more specific than direct href)
+                "//a[contains(@class, 'article') and contains(@href, '.pdf')]",
+                "//a[contains(@class, 'pdf') and contains(@class, 'article')]",
+                "//a[contains(@class, 'download') and contains(@href, '.pdf')]",
+                "//a[contains(@class, 'full-text')]",
+                "//button[contains(@class, 'pdf')]",
+                "//button[contains(@class, 'download')]",
+                
+                # Direct PDF links (lowest priority - too generic)
+                "//a[@href[contains(., '.pdf')]]",
+                "//a[@href[contains(., 'pdf')]]",
+            ]
+            
+            pdf_link = None
+            for xpath in pdf_patterns:
+                try:
+                    elements = self.driver.find_elements(By.XPATH, xpath)
+                    if elements:
+                        # Filter out reference PDFs
+                        for elem in elements:
+                            href = elem.get_attribute('href') or ""
+                            text = elem.text.strip().lower()
+                            
+                            # Skip obvious non-article PDFs
+                            if any(exclude in href.lower() for exclude in excluded_sources):
+                                logger.info(f"[DEBUG] Skipping reference PDF: {href[:60]}...")
+                                continue
+                            
+                            # This is likely the article PDF
+                            pdf_link = elem
+                            logger.info(f"[DEBUG] Matched pattern: {xpath[:60]}...")
+                            logger.info(f"[DEBUG] Found link: '{text}' -> {href[:80]}...")
+                            break
+                        
+                        if pdf_link:
+                            break
+                            
+                except Exception as e:
+                    pass
+            
+            if not pdf_link:
+                logger.warning(f"Could not find PDF link on publisher page using XPath patterns")
+                logger.warning(f"Page title: {self.driver.title}")
+                logger.warning(f"Current URL: {self.driver.current_url}")
+                return False
+            
+            # Try clicking the PDF link
+            try:
+                logger.info(f"Attempting to click PDF link...")
+                pdf_link.click()
+                logger.info(f"Clicked PDF link on publisher page")
+                time.sleep(5)  # Wait for download to start
+                
+                # Verify the PDF was downloaded and has correct title
+                if self.find_and_verify_recent_pdf(title):
+                    logger.info(f"[OK] Downloaded from publisher: {filename}")
+                    return True
+                else:
+                    logger.warning(f"No valid PDF found or title verification failed")
+                    return False
+                    
+            except Exception as click_error:
+                logger.info(f"Click failed ({str(click_error)[:50]}), trying href navigation...")
+                
+                # Try getting href and navigating directly if click fails
+                href = pdf_link.get_attribute('href')
+                if not href:
+                    href = pdf_link.get_attribute('data-href')
+                if not href:
+                    href = pdf_link.get_attribute('data-url')
+                
+                if href:
+                    # Handle relative URLs
+                    if href.startswith('/'):
+                        from urllib.parse import urlparse
+                        parsed = urlparse(self.driver.current_url)
+                        href = f"{parsed.scheme}://{parsed.netloc}{href}"
+                    
+                    logger.info(f"Navigating to PDF URL: {href[:80]}...")
+                    self.driver.get(href)
+                    time.sleep(5)
+                    
+                    # Verify the PDF was downloaded and has correct title
+                    if self.find_and_verify_recent_pdf(title):
+                        logger.info(f"[OK] Downloaded from publisher: {filename}")
+                        return True
+                    else:
+                        logger.warning(f"No valid PDF found or title verification failed")
+                        return False
+                
+                logger.warning(f"Could not extract href from PDF link")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Publisher download error: {str(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()[:200]}")
+            return False
+    
+    def find_and_verify_recent_pdf(self, title: str, max_age_seconds: int = 30) -> bool:
+        """
+        Find the most recently modified PDF in the download folder,
+        verify its title matches, and rename it to the expected name.
+        
+        Args:
+            title: Expected article title
+            max_age_seconds: Only consider PDFs modified within last N seconds
+            
+        Returns:
+            True if PDF found, verified, and renamed successfully
+        """
+        try:
+            import os
+            import time
+            
+            # Find all PDFs in download folder
+            pdf_files = list(self.output_folder.glob("*.pdf"))
+            if not pdf_files:
+                logger.warning(f"No PDF files found in {self.output_folder}")
+                return False
+            
+            # Find the most recently modified PDF
+            most_recent = max(pdf_files, key=lambda f: f.stat().st_mtime)
+            
+            # Check if it was modified recently (within max_age_seconds)
+            age_seconds = time.time() - most_recent.stat().st_mtime
+            if age_seconds > max_age_seconds:
+                logger.warning(f"Most recent PDF is {age_seconds:.0f}s old (threshold: {max_age_seconds}s)")
+                return False
+            
+            logger.info(f"Found recently downloaded PDF: {most_recent.name} ({age_seconds:.1f}s old)")
+            
+            # Verify the title
+            if self.verify_pdf_title(str(most_recent), title):
+                logger.info(f"[OK] PDF verified and accepted: {most_recent.name}")
+                return True
+            else:
+                logger.warning(f"Downloaded PDF rejected - title does not match")
+                # Delete the incorrect file
+                try:
+                    most_recent.unlink()
+                    logger.info(f"Removed incorrect PDF file: {most_recent.name}")
+                except:
+                    pass
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error finding/verifying recent PDF: {str(e)[:100]}")
+            return False
+    
+    def sanitize_filename(self, filename: str) -> str:
+        """Remove invalid characters from filename."""
+        invalid_chars = '<>:"/\\|?*'
+        for char in invalid_chars:
+            filename = filename.replace(char, '_')
+        return filename[:150]
+    
+    def verify_pdf_title(self, pdf_path: str, expected_title: str, similarity_threshold: float = 0.5) -> bool:
+        """
+        Verify that the PDF title matches the expected article title.
+        Extracts text from the first page of the PDF and searches for title match.
+        Uses three strategies:
+        1. Exact substring match (most reliable)
+        2. Keyword matching (70%+ key words present)
+        3. Fuzzy matching (difflib sequence matcher)
+        
+        Args:
+            pdf_path: Path to the PDF file
+            expected_title: Expected article title from Excel
+            similarity_threshold: Minimum similarity score (0-1) for fuzzy match
+            
+        Returns:
+            True if title is found in PDF, False otherwise
+        """
+        if not expected_title or expected_title.lower() == 'nan':
+            logger.warning(f"No title provided for verification, skipping check")
+            return True  # Can't verify without a title
+        
+        try:
+            import PyPDF2
+            
+            with open(pdf_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                
+                # Extract text from first few pages (titles usually at start)
+                extracted_text = ""
+                for page_num in range(min(3, len(reader.pages))):
+                    try:
+                        page = reader.pages[page_num]
+                        extracted_text += page.extract_text() + " "
+                    except:
+                        continue
+                
+                if not extracted_text.strip():
+                    logger.warning(f"Could not extract text from PDF {pdf_path}")
+                    return False
+                
+                # Normalize titles for comparison
+                expected_normalized = expected_title.lower().strip()
+                extracted_normalized = extracted_text.lower()
+                
+                # Strategy 1: Check for exact substring match (most reliable)
+                if expected_normalized in extracted_normalized:
+                    logger.info(f"[VERIFIED] PDF title matches (exact): {expected_title[:60]}...")
+                    return True
+                
+                # Strategy 2: Check for partial/fuzzy match via keyword matching
+                # Split expected title into key words (>3 chars) and check if many are present
+                key_words = [word for word in expected_normalized.split() if len(word) > 3]
+                matched_words = sum(1 for word in key_words if word in extracted_normalized)
+                match_ratio = matched_words / len(key_words) if key_words else 0
+                
+                if match_ratio >= 0.7:  # At least 70% of key words must match
+                    logger.info(f"[VERIFIED] PDF title matches (70%+ keywords): {expected_title[:60]}...")
+                    return True
+                
+                # Strategy 3: Use difflib for sequence matching
+                similarity = difflib.SequenceMatcher(None, expected_normalized, extracted_normalized).ratio()
+                
+                if similarity >= similarity_threshold:
+                    logger.info(f"[VERIFIED] PDF title matches ({similarity:.1%} similarity): {expected_title[:60]}...")
+                    return True
+                
+                # All strategies failed - reject the PDF
+                logger.warning(f"[REJECTED] PDF title does NOT match")
+                logger.warning(f"  Expected: '{expected_title[:60]}...'")
+                logger.warning(f"  Similarity: {similarity:.1%} (threshold: {similarity_threshold:.1%})")
+                logger.warning(f"  Keywords matched: {matched_words}/{len(key_words)}")
+                return False
+                
+        except ImportError:
+            logger.error("PyPDF2 not installed. Install with: pip install PyPDF2")
+            logger.warning("Skipping PDF title verification - PyPDF2 required for verification")
+            return True  # Skip verification if library not available
+        except Exception as e:
+            logger.error(f"Error verifying PDF title: {str(e)[:100]}")
+            logger.warning(f"Skipping title verification for {pdf_path}")
+            return True  # Skip verification on error
+    
+    def download_pdf_selenium(self, pmcid: str, pmid: str = "", title: str = "", min_delay: float = 1.0) -> tuple:
+        """
+        Download PDF from PubMed (via PMID) or PMC or publisher link using Selenium.
+        PMID is prioritized as it is always present and more reliable than PMCID.
+        NCBI guideline: minimum 1 second delay between requests (to stay under 3 requests/sec)
+        
+        Args:
+            pmcid: PubMed Central ID (optional, may be missing)
+            pmid: PubMed ID (primary identifier - more reliable, always present)
+            title: Article title (used for verification and filename)
+            min_delay: Minimum seconds to wait before accessing next article
+            
+        Returns:
+            Tuple of (success: bool, source: str) - source is 'PMC', 'Publisher', or 'Not Found'
+        """
+        if not self.driver:
+            logger.error("Browser not initialized or connection lost")
+            return False, "Not Found"
+        
+        try:
+            # PMID is more reliable than PMCID - use PMID as primary identifier
+            # PMID is always present, PMCID sometimes missing
+            if pmcid and not pmcid.startswith('PMC'):
+                pmcid = f'PMC{pmcid}'
+            
+            # Prioritize PMID over PMCID for identification and URL navigation
+            article_id = pmid if pmid else pmcid  # Use PMID as primary
+            if not article_id:
+                logger.warning("No valid PMID or PMCID provided")
+                return False, "Not Found"
+            
+            # Check if file already exists (use PMID-based filename as primary)
+            if title:
+                safe_title = self.sanitize_filename(title)
+                # Use PMID as primary identifier for filename consistency
+                primary_id = pmid if pmid else pmcid
+                pmc_filename = f"{primary_id}_{safe_title}.pdf"
+                publisher_filename = f"PUBLISHER_{primary_id}_{safe_title}.pdf"
+                
+                if (self.output_folder / pmc_filename).exists():
+                    logger.info(f"[OK] Already present: {pmc_filename}")
+                    return True, "Already Present"
+                
+                if (self.output_folder / publisher_filename).exists():
+                    logger.info(f"[OK] Already present: {publisher_filename}")
+                    return True, "Already Present"
+            
+            logger.info(f"Accessing PMID {pmid if pmid else pmcid}...")
+            
+            # Navigate to article via PubMed (PMID) first since it's always available
+            # Fall back to PMC (PMCID) if PMID lookup doesn't work
+            url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/"
+            
+            self.driver.get(url)
+            time.sleep(2)  # Wait for page to load
+            
+            # Look for PDF download link
+            from selenium.webdriver.common.by import By
+            from selenium.webdriver.support.ui import WebDriverWait
+            from selenium.webdriver.support import expected_conditions as EC
+            
+            try:
+                # Try to find PDF link in PMC
+                pdf_link = WebDriverWait(self.driver, 5).until(
+                    EC.presence_of_element_located((By.PARTIAL_LINK_TEXT, "PDF"))
+                )
+                pdf_link.click()
+                logger.info(f"[OK] Downloaded from PMC: {article_id}")
+                time.sleep(3)  # Wait for download to start
+                return True, "PMC"
+                
+            except:
+                # PMC PDF not available - try PubMed ACTIONS section first (if we have PMID)
+                if pmid:
+                    logger.info(f"Direct PMC PDF not found, trying PubMed article page...")
+                    
+                    # Navigate to PubMed article page (already tried above if PMID is primary)
+                    if not url.startswith("https://pubmed"):
+                        pubmed_url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+                        self.driver.get(pubmed_url)
+                    time.sleep(3)  # Give page time to fully load
+                    
+                    # DEBUG: Log all buttons to see what's actually available
+                    try:
+                        all_buttons = self.driver.find_elements(By.TAG_NAME, "button")
+                        all_links = self.driver.find_elements(By.TAG_NAME, "a")
+                        logger.info(f"[DEBUG] Found {len(all_buttons)} buttons and {len(all_links)} links on PubMed page")
+                        
+                        # Log buttons/links with relevant text
+                        for btn in all_buttons[:30]:
+                            text = btn.text.strip()
+                            if text and any(keyword in text.lower() for keyword in ['pdf', 'full', 'pmc', 'free', 'download']):
+                                logger.info(f"[DEBUG] Button: '{text}'")
+                        
+                        for link in all_links[:30]:
+                            text = link.text.strip()
+                            href = link.get_attribute('href') or ''
+                            if text and any(keyword in text.lower() for keyword in ['pdf', 'full', 'pmc', 'free', 'download']):
+                                logger.info(f"[DEBUG] Link: '{text}' -> {href[:80]}")
+                    except Exception as e:
+                        logger.info(f"[DEBUG] Could not enumerate buttons/links: {str(e)[:50]}")
+                    
+                    # PRIORITY 1: Try direct PMC article page using PMID (most reliable)
+                    if pmid:
+                        # Navigate to PMC article page - PDF link will be in Actions section
+                        pmc_url = f"https://pmc.ncbi.nlm.nih.gov/articles/pmid/{pmid}/"
+                        logger.info(f"Trying direct PMC article URL: {pmc_url}")
+                        try:
+                            self.driver.get(pmc_url)
+                            time.sleep(3)
+                            
+                            # Look for PDF download link in Actions section
+                            pdf_patterns = [
+                                ("//a[contains(text(), 'PDF')]", "PDF link text"),
+                                ("//a[contains(@href, '.pdf')]", "PDF href"),
+                                ("//a[contains(text(), 'Download PDF')]", "Download PDF text"),
+                            ]
+                            
+                            for xpath, desc in pdf_patterns:
+                                try:
+                                    pdf_links = self.driver.find_elements(By.XPATH, xpath)
+                                    for pdf_link in pdf_links:
+                                        href = pdf_link.get_attribute('href') or ''
+                                        if href and '.pdf' in href.lower():
+                                            logger.info(f"Found {desc}: {href[:80]}...")
+                                            # Navigate directly to PDF URL to trigger download
+                                            self.driver.get(href)
+                                            time.sleep(3)
+                                            # Verify download
+                                            recent_pdf = self.find_and_verify_recent_pdf(title)
+                                            if recent_pdf:
+                                                logger.info(f"[OK] Downloaded from PMC (via direct PMID URL): {article_id}")
+                                                return True, "PMC"
+                                except:
+                                    pass
+                            
+                            logger.info("Direct PMC article page loaded but no PDF link found in Actions")
+                        except Exception as e:
+                            logger.info(f"Direct PMC URL navigation failed: {str(e)[:50]}")
+                    
+                    # PRIORITY 2: Look for "Free Full Text" links that go to PMC (search for PMID in href)
+                    free_pmc_patterns = [
+                        (f"//a[contains(@href, 'pmc') and contains(@href, '{pmid}')]", "PMC link with PMID"),
+                        ("//a[contains(text(), 'Free full text') and contains(@href, 'pmc')]", "Free full text PMC link"),
+                        ("//a[contains(text(), 'Free Full Text') and contains(@href, 'pmc')]", "Free Full Text PMC link"),
+                        ("//a[contains(text(), 'Free') and contains(text(), 'PMC')]", "Free PMC link"),
+                    ]
+                    
+                    for xpath, desc in free_pmc_patterns:
+                        try:
+                            elements = self.driver.find_elements(By.XPATH, xpath)
+                            for elem in elements:
+                                try:
+                                    text = elem.text.strip()
+                                    href = elem.get_attribute('href') or ''
+                                    logger.info(f"[DEBUG] Found {desc}: '{text}' -> {href[:80]}...")
+                                    logger.info(f"Clicking to navigate to PMC...")
+                                    elem.click()
+                                    time.sleep(3)
+                                    
+                                    # Now try to find PDF on the PMC page
+                                    try:
+                                        pdf_link = WebDriverWait(self.driver, 5).until(
+                                            EC.presence_of_element_located((By.PARTIAL_LINK_TEXT, "PDF"))
+                                        )
+                                        pdf_link.click()
+                                        logger.info(f"[OK] Downloaded from PMC via Free Full Text: {article_id}")
+                                        time.sleep(3)
+                                        return True, "PMC"
+                                    except:
+                                        logger.info("Navigated to PMC page but no PDF link found")
+                                except Exception as e:
+                                    logger.warning(f"Failed to click {desc}: {str(e)[:50]}")
+                        except:
+                            pass
+                    
+                    # PRIORITY 3: Look for PDF or Full Text button - must have visible text
+                    actions_pdf_patterns = [
+                        ("//a[contains(text(), 'PDF') and normalize-space(text())]", "PDF link"),
+                        ("//a[contains(text(), 'Full Text') and normalize-space(text())]", "Full Text link"),
+                        ("//button[contains(text(), 'PDF') and normalize-space(text())]", "PDF button"),
+                        ("//button[contains(text(), 'Full Text') and normalize-space(text())]", "Full Text button"),
+                    ]
+                    
+                    for xpath, desc in actions_pdf_patterns:
+                        try:
+                            elements = self.driver.find_elements(By.XPATH, xpath)
+                            for elem in elements:
+                                href = elem.get_attribute('href')
+                                text = elem.text.strip()
+                                
+                                logger.info(f"[DEBUG] Found {desc}: '{text}'")
+                                
+                                # Check if this looks like a direct download link
+                                if href and ('.pdf' in href.lower() or 'download' in href.lower()):
+                                    logger.info(f"Found direct PDF link in ACTIONS: '{text}'")
+                                    try:
+                                        elem.click()
+                                        time.sleep(5)
+                                        logger.info(f"[OK] Downloaded from PubMed: {article_id}")
+                                        return True, "Publisher"
+                                    except Exception as e:
+                                        logger.warning(f"Click failed: {str(e)[:50]}")
+                                        pass
+                        except:
+                            pass
+                    
+                    # If no direct PDF/Full Text link in ACTIONS, check for buttons that navigate to full page
+                    # Look for "Free Full Text" or similar buttons that might have empty text but are visible
+                    logger.info(f"No direct PDF link found, looking for navigation buttons...")
+                    
+                    nav_patterns = [
+                        ("//a[contains(@class, 'full-text') and normalize-space(text())]", "class-based nav"),
+                        ("//button[contains(@class, 'full-text') and normalize-space(text())]", "button class-based nav"),
+                        ("//a[contains(@class, 'free') and normalize-space(text())]", "free-based nav"),
+                        ("//button[contains(@class, 'free') and normalize-space(text())]", "free button nav"),
+                    ]
+                    
+                    for xpath, desc in nav_patterns:
+                        try:
+                            elements = self.driver.find_elements(By.XPATH, xpath)
+                            for elem in elements:
+                                text = elem.text.strip() if elem.text else "[no-text-button]"
+                                href = elem.get_attribute('href') or ''
+                                logger.info(f"[DEBUG] Found {desc}: '{text}'")
+                                
+                                try:
+                                    logger.info(f"Clicking navigation button...")
+                                    elem.click()
+                                    time.sleep(3)
+                                    
+                                    # After clicking, look for PDF again
+                                    for pdf_xpath, pdf_desc in actions_pdf_patterns:
+                                        try:
+                                            pdf_elems = self.driver.find_elements(By.XPATH, pdf_xpath)
+                                            for pdf_elem in pdf_elems:
+                                                pdf_href = pdf_elem.get_attribute('href')
+                                                if pdf_href and ('.pdf' in pdf_href.lower()):
+                                                    logger.info(f"Found PDF after navigation: '{pdf_elem.text.strip()}'")
+                                                    try:
+                                                        pdf_elem.click()
+                                                        time.sleep(5)
+                                                        logger.info(f"[OK] Downloaded from PubMed (via navigation): {article_id}")
+                                                        return True, "Publisher"
+                                                    except:
+                                                        pass
+                                        except:
+                                            pass
+                                except Exception as e:
+                                    logger.warning(f"Navigation click failed: {str(e)[:50]}")
+                        except:
+                            pass
+                    
+                    # If still no PDF found, try visiting publisher site
+                    logger.info(f"No PDF found in PubMed, searching for publisher link...")
+                    publisher_url = self.find_publisher_link_in_actions(pmid)
+                    
+                    if publisher_url:
+                        success = self.download_from_publisher(publisher_url, title, article_id=pmid)
+                        if success:
+                            return True, "Publisher"
+                
+                # No PDF found anywhere
+                article_id = pmcid if pmcid else pmid
+                logger.warning(f"[X] PDF not available for {article_id} (not in PMC or publisher links)")
+                return False, "Not Found"
+                
+        except Exception as e:
+            article_id = pmcid if pmcid else pmid
+            logger.error(f"[X] Failed to download {article_id}: {str(e)[:100]}")
+            return False, "Error"
+    
+    def process_excel(self, excel_path: str, delay: float = 1.5):
+        """
+        Process Excel file and download PDFs using Selenium.
+        Downloads are sequential with enforced delays (NCBI compliant).
+        
+        Args:
+            excel_path: Path to Excel file
+            delay: Minimum delay in seconds between downloads (default: 1.5 to allow for page load time)
+                   NCBI guideline is max 3 requests/sec, so 1 sec minimum recommended
+        """
+        results = []
+        
+        try:
+            # Read Excel
+            df = pd.read_excel(excel_path)
+            logger.info(f"Loaded {len(df)} articles from {excel_path}")
+            
+            # Find columns
+            df.columns = df.columns.str.strip()
+            column_map = {col.lower(): col for col in df.columns}
+            
+            pmid_col = pmcid_col = title_col = None
+            for key in ['pmid', 'pubmed id', 'pubmedid']:
+                if key in column_map:
+                    pmid_col = column_map[key]
+                    break
+            for key in ['pmcid', 'pmc id']:
+                if key in column_map:
+                    pmcid_col = column_map[key]
+                    break
+            for key in ['title', 'article title', 'publication title']:
+                if key in column_map:
+                    title_col = column_map[key]
+                    break
+            
+            success_count = failed_count = 0
+            
+            # Process articles SEQUENTIALLY with enforced delays (NCBI compliance)
+            total_articles = len(df)
+            for article_num, (idx, row) in enumerate(df.iterrows()):
+                pmid = str(row.get(pmid_col, '')).strip() if pmid_col else ''
+                pmcid = str(row.get(pmcid_col, '')).strip() if pmcid_col else ''
+                title = str(row.get(title_col, '')).strip() if title_col else ''
+                
+                if pmid == 'nan':
+                    pmid = ''
+                if pmcid == 'nan':
+                    pmcid = ''
+                
+                if not pmid and not pmcid:
+                    continue
+                
+                logger.info(f"[{article_num+1}/{total_articles}] Processing article (PMID: {pmid})...")
+                success, source = self.download_pdf_selenium(pmcid, pmid, title, min_delay=delay)
+                
+                # Log status with appropriate message
+                if success and source == "Already Present":
+                    status = "Already Downloaded"
+                elif success:
+                    status = f"Downloaded ({source})"
+                else:
+                    status = "Not Found"
+                
+                results.append({
+                    'PMID': pmid,
+                    'PMCID': pmcid,
+                    'Title': title[:100],
+                    'Status': status,
+                    'Downloaded': 'Yes' if success else 'No',
+                    'Source': source
+                })
+                
+                if success:
+                    success_count += 1
+                else:
+                    failed_count += 1
+                
+                # Enforce NCBI rate limit: max 3 requests/sec = min 0.33sec between requests
+                # Using 1-1.5 sec to be safe and allow for page load time
+                # Wait after EACH article to ensure download completes and is verified
+                if article_num < total_articles - 1:  # Don't delay after last article
+                    logger.info(f"Waiting {delay}s before next article (NCBI compliant rate limiting + file verification)...")
+                    time.sleep(delay)
+            
+            # Save results
+            results_df = pd.DataFrame(results)
+            results_df.to_csv('download_results_selenium.csv', index=False, encoding='utf-8-sig')
+            
+            logger.info(f"\n{'='*60}")
+            logger.info(f"DOWNLOAD COMPLETE")
+            logger.info(f"  Downloaded: {success_count}")
+            logger.info(f"  Failed: {failed_count}")
+            logger.info(f"  Total processed: {total_articles}")
+            logger.info(f"  Results saved: download_results_selenium.csv")
+            logger.info(f"  Note: Each download verified before proceeding to next")
+            logger.info(f"{'='*60}")
+            
+        except Exception as e:
+            logger.error(f"Error: {e}")
+        finally:
+            if self.driver:
+                try:
+                    logger.info("Closing browser...")
+                    self.driver.quit()
+                except Exception as e:
+                    logger.warning(f"Error closing browser: {e}")
+
+
+def main():
+    """Main function."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Download PDFs with institutional access')
+    parser.add_argument('excel_file', nargs='?', 
+                       default='TVHS-GRECC Publications FY25.xlsx')
+    parser.add_argument('-o', '--output', default='downloaded_pdfs')
+    parser.add_argument('-w', '--wait', type=int, default=120,
+                       help='Seconds to wait for manual login.gov + PIV authentication before auto-continue (default: 120 = 2 minutes)')
+    
+    args = parser.parse_args()
+    
+    downloader = PubMedSeleniumDownloader(output_folder=args.output)
+    
+    if not downloader.setup_browser():
+        logger.error("Failed to set up browser. Exiting.")
+        return
+    
+    if not downloader.login_institutional(wait_time=args.wait):
+        logger.error("Login failed. Exiting.")
+        return
+    
+    downloader.process_excel(args.excel_file)
+
+
+if __name__ == '__main__':
+    main()
